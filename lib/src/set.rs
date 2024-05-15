@@ -116,7 +116,7 @@ pub async fn get_head_to_head_record(requester_id_param: i32) -> Result<Vec<Head
     let sgg = StartGG::connect();
     let mut h2h_query_responses: Vec<Value> = Vec::new();
     //println!("{}", num_of_req);
-    for request in 0..num_of_req {
+    for _ in 0..num_of_req {
         let mut query = String::from(
             "
         query InProgressSet {
