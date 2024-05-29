@@ -1,4 +1,3 @@
-use crate::player::get_player;
 use anyhow::Result;
 use diesel::{
     dsl::sql,
@@ -25,40 +24,43 @@ pub struct HeadToHeadResult {
     pub losses: i64,
 }
 
-async fn responses_to_results(
+async fn sgg_h2h_response_to_results(
     req_player_id: i32,
     data: Vec<Value>,
     db_results: &Vec<HeadToHeadResult>,
 ) -> Vec<HeadToHeadResult> {
-    let mut p2id: HashMap<String, i32> = HashMap::new();
-    for x in data {
-        if let Some(obj) = x.as_object() {
-            for (_, set) in obj {
-                if let Some(slots) = set.as_object() {
-                    for (_, entrants) in slots {
-                        for entrant in entrants.as_array().unwrap() {
-                            if let Some(set_info) = entrant.as_object() {
-                                let oppo_name =
-                                    set_info["entrant"]["name"].as_str().unwrap().into();
-                                if let Some(returned_id) =
-                                    set_info["entrant"]["participants"][0]["player"]["id"].as_i64()
-                                {
-                                    let oppo_id = returned_id as i32;
-                                    if req_player_id != oppo_id {
-                                        p2id.insert(oppo_name, oppo_id);
-                                    }
-                                }
-                            }
-                        }
+    let mut name_to_id_sgg: HashMap<String, i32> = HashMap::new();
+    for query in data {
+        for (_, set) in query.as_object().unwrap() {
+            for (_, slots) in set.as_object().unwrap() {
+                for entrant in slots.as_array().unwrap() {
+                    let e_id = entrant
+                        .pointer("/entrant/participants/0/player/id")
+                        .and_then(Value::as_i64)
+                        .unwrap() as i32;
+                    if e_id != req_player_id {
+                        let e_name = entrant
+                            .pointer("/entrant/name")
+                            .and_then(Value::as_str)
+                            .map(String::from)
+                            .unwrap();
+                        name_to_id_sgg.insert(e_name, e_id);
                     }
                 }
             }
         }
     }
+
+    let id_to_name_sgg: HashMap<i32, String> = name_to_id_sgg
+        .iter()
+        .map(|(k, &v)| (v, k.clone()))
+        .collect();
+
     let mut results_by_id: HashMap<i32, HeadToHeadResult> = HashMap::new();
+
     for h2hr in db_results {
         let tag = &h2hr.opponent_tag;
-        let h2hr_oppo_id = p2id.get(tag).unwrap();
+        let h2hr_oppo_id = name_to_id_sgg.get(tag).unwrap();
         if let Some(cur_h2h) = results_by_id.get_mut(h2hr_oppo_id) {
             //Already in final results, user is listed under multiple names.
             cur_h2h.total_sets += h2hr.total_sets;
@@ -67,17 +69,13 @@ async fn responses_to_results(
         } else {
             //First time
             let mut name = String::new();
-            match get_player(*h2hr_oppo_id).await {
-                Ok(oppo) => {
-                    name = format!(
-                        "{} {}",
-                        oppo.prefix.unwrap_or("".to_string()),
-                        oppo.gamer_tag
-                    );
+            match id_to_name_sgg.get(h2hr_oppo_id) {
+                Some(player_gamertag) => {
+                    name = player_gamertag.to_string();
                 }
-                Err(_) => {
-                    //Player was not found in DB, just accept whatever name we got
-                    //this probably wont happen very often in production since most (all?) players are mapped
+                None => {
+                    //Name was not returned by start.gg? or wasnt found?
+                    //Not sure when this would occur but if everything goes wrong, use old name
                     name.clone_from(&h2hr.opponent_tag);
                 }
             }
@@ -109,64 +107,81 @@ pub async fn get_head_to_head_record(requester_id_param: i32) -> Result<Vec<Head
     .load::<HeadToHeadResult>(&mut db_connection)
     .await?;
 
-    let mut current_opponent = 0;
-    let unique_count = results.len();
+    //111 is chosen because 1000 (max objects) / 9 (complexity of 1 set query)
+    //1000 max is for a normal Start.gg Key, may be raised with a privileged one?
+    let num_of_req = u64::div_ceil(results.len() as u64, 111);
 
-    let num_of_req = u64::div_ceil(unique_count as u64, 111);
-    let sgg = StartGG::connect();
+    //The aliases don't really matter but are nessary since the api wont execute the same
+    //query type mutliple times unless they are given distinct names.
+    let query_aliases: Vec<String> = (0..111).map(|i| format!("{}", i)).collect();
+
+    //Names of all opponents returned by database
+    let opponents: Vec<String> = results.iter().map(|x| x.opponent_tag.clone()).collect();
+
+    //This gets the ID of a single set from every opponent
+    let mut set_ids: Vec<i32> = player_sets
+        .filter(requester_id.eq(requester_id_param))
+        .filter(opponent_tag_with_prefix.eq_any(opponents))
+        .distinct_on(opponent_tag_with_prefix)
+        .select(id)
+        .load::<i32>(&mut db_connection)
+        .await?;
+
     let mut h2h_query_responses: Vec<Value> = Vec::new();
-    //println!("{}", num_of_req);
+    let sgg = StartGG::connect();
     for _ in 0..num_of_req {
-        let mut query = String::from(
-            "
-        query InProgressSet {
-        ",
-        );
-        for set_num in 0..111 {
-            if current_opponent < unique_count {
-                let opponent_name = &results[current_opponent].opponent_tag;
-                let set_with_opponent_id = player_sets
-                    .filter(
-                        requester_id
-                            .eq(requester_id_param)
-                            .and(opponent_tag_with_prefix.eq(opponent_name)),
-                    )
-                    .select(id)
-                    .first::<i32>(&mut db_connection)
-                    .await?;
-                query.push_str(&format!(
-                    r#"s{}: set(id: "{}") {{
-                        slots {{
-                          entrant {{
-                            name
-                            participants {{
-                              player {{
-                                id
-                              }}
-                            }}
-                          }}
-                        }}
-                    }}"#,
-                    set_num, set_with_opponent_id
-                ));
-                current_opponent += 1;
+        let set_count = set_ids.len();
+        let mut query: String = query_aliases
+            .iter()
+            .zip(set_ids.iter())
+            .map(|(alias, set_id)| {
+                format!(
+                    r#"
+                s{}: set(id: "{}") {{
+                    ...setFields
+                }}"#,
+                    alias, set_id
+                )
+            })
+            .collect();
+        query.insert_str(
+            0,
+            r#"
+        fragment setFields on Set {
+            slots {
+                entrant {
+                name
+                participants {
+                    player {
+                    id
+                    }
+                }
+                }
             }
         }
+        query InProgressSet {
+        "#,
+        );
         query.push('}');
+
+        //If more than 1 query is needed, remove the already requested sets from the list
+        //Using an iterator to auto consume was being difficult so I just went with this.
+        if set_count > 111 {
+            set_ids.drain(0..111);
+        }
+
         let h2h_query_response = sgg.gql_client().query::<Value>(&query).await;
 
         match h2h_query_response {
             Ok(h2h_response) => {
-                let d = h2h_response.unwrap();
-                h2h_query_responses.push(d);
+                h2h_query_responses.push(h2h_response.unwrap());
             }
             Err(err) => {
                 println!("SGG H2H query has failed: {}", err);
             }
         }
     }
-
-    Ok(responses_to_results(requester_id_param, h2h_query_responses, &results).await)
+    Ok(sgg_h2h_response_to_results(requester_id_param, h2h_query_responses, &results).await)
 }
 
 pub async fn get_all_from_player_id(player_id: i32) -> Result<Vec<Set>> {
