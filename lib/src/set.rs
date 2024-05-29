@@ -11,6 +11,7 @@ use smithe_database::{db_models::set::Set, schema::player_sets::dsl::*};
 use startgg::StartGG;
 use startgg::{Set as SGGSet, SetSlot as SGGSetSlot};
 use std::collections::HashMap;
+use std::fmt::Write;
 
 #[derive(Debug, Serialize, QueryableByName, Clone)]
 pub struct HeadToHeadResult {
@@ -130,20 +131,22 @@ pub async fn get_head_to_head_record(requester_id_param: i32) -> Result<Vec<Head
     let mut h2h_query_responses: Vec<Value> = Vec::new();
     let sgg = StartGG::connect();
     for _ in 0..num_of_req {
-        let set_count = set_ids.len();
-        let mut query: String = query_aliases
+        let mut query = String::new();
+        query_aliases
             .iter()
             .zip(set_ids.iter())
-            .map(|(alias, set_id)| {
-                format!(
+            .fold(&mut query, |query, (alias, set_id)| {
+                write!(
+                    query,
                     r#"
-                s{}: set(id: "{}") {{
-                    ...setFields
-                }}"#,
+                    s{}: set(id: "{}") {{
+                        ...setFields
+                    }}"#,
                     alias, set_id
                 )
-            })
-            .collect();
+                .unwrap();
+                query
+            });
         query.insert_str(
             0,
             r#"
@@ -166,7 +169,7 @@ pub async fn get_head_to_head_record(requester_id_param: i32) -> Result<Vec<Head
 
         //If more than 1 query is needed, remove the already requested sets from the list
         //Using an iterator to auto consume was being difficult so I just went with this.
-        if set_count > 111 {
+        if set_ids.len() > 111 {
             set_ids.drain(0..111);
         }
 
