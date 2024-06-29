@@ -109,11 +109,10 @@ pub async fn get_head_to_head_record(requester_id_param: i32) -> Result<Vec<Head
     .await?;
 
     //111 is chosen because 1000 (max objects) / 9 (complexity of 1 set query)
-    //1000 max is for a normal Start.gg Key, may be raised with a privileged one?
     let num_of_req = u64::div_ceil(results.len() as u64, 111);
 
-    //The aliases don't really matter but are nessary since the api wont execute the same
-    //query type mutliple times unless they are given distinct names.
+    //The aliases don't really matter but are necessary since the API won't execute
+    //the same query type multiple times unless they are given distinct names.
     let query_aliases: Vec<String> = (0..111).map(|i| format!("{}", i)).collect();
 
     //Names of all opponents returned by database
@@ -167,17 +166,19 @@ pub async fn get_head_to_head_record(requester_id_param: i32) -> Result<Vec<Head
         );
         query.push('}');
 
-        //If more than 1 query is needed, remove the already requested sets from the list
-        //Using an iterator to auto consume was being difficult so I just went with this.
-        if set_ids.len() > 111 {
-            set_ids.drain(0..111);
-        }
-
         let h2h_query_response = sgg.gql_client().query::<Value>(&query).await;
 
         match h2h_query_response {
             Ok(h2h_response) => {
                 h2h_query_responses.push(h2h_response.unwrap());
+                //If more than 1 query is needed, remove the already requested sets from the list
+                //Using an iterator to auto consume was being difficult so I just went with this.
+
+                //This was moved here to so that if the query fails for some reason such as
+                //Start.gg being down or API key getting rate limited, It will retry (immediately)
+                if set_ids.len() > 111 {
+                    set_ids.drain(0..111);
+                }
             }
             Err(err) => {
                 println!("SGG H2H query has failed: {}", err);
